@@ -40,7 +40,9 @@ def assemble(inputSFile,
 
     # assembler
     cmd = [pathlib.Path("/opt/rocm/bin/amdclang++")]
-    cmd += ['-x','assembler', '-target','amdgcn-amd-amdhsa', "-mcode-object-version=4", f'-mcpu={arch}', "-mwavefrontsize64"]
+    # Use wave32 (-mno-wavefrontsize64); this assembly is generated for wave32. With -mwavefrontsize64 you get "invalid operand for instruction".
+    cmd += ['-x','assembler', '-target','amdgcn-amd-amdhsa', "-mcode-object-version=4", f'-mcpu={arch}', "-mno-wavefrontsize64"]
+    cmd += ['-g']  # emit debug info so rocgdb can break at file:line in the .s
     cmd += ['-c','-o', f'{outputOFile}', f'{inputSFile}']
 
     cmd = [str(x) for x in cmd]
@@ -67,7 +69,6 @@ def assemble(inputSFile,
     cmd = [pathlib.Path("/opt/rocm/bin/amdclang++")]
     cmd += ['-target','amdgcn-amd-amdhsa', "-Xlinker", "--build-id=sha1"]
     cmd += ['-o', f'{outputCOFile}', f'{outputOFile}']
-
     cmd = [str(x) for x in cmd]
     logging.info('linker command: ' + ' '.join(cmd))
     if verbose:

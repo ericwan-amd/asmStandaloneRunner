@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A (M=16, K=32) doSwizzle 前後 Memory Layout</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --card: #18181c;
+      --border: #2a2a30;
+      --text: #e4e4e7;
+      --dim: #71717a;
+      --accent: #a78bfa;
+      --accent2: #34d399;
+      --grid: #27272a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      letter-spacing: 0.02em;
+    }
+    .sub {
+      font-size: 0.85rem;
+      color: var(--dim);
+      margin-bottom: 24px;
+    }
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      max-width: 1400px;
+    }
+    @media (max-width: 1000px) { .panels { grid-template-columns: 1fr; } }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      overflow: auto;
+    }
+    .panel h2 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin: 0 0 12px 0;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .panel h2 .formula {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      font-weight: 400;
+      color: var(--dim);
+    }
+    .grid-wrap {
+      overflow: auto;
+      margin-top: 8px;
+    }
+    table {
+      border-collapse: collapse;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+    }
+    td {
+      border: 1px solid var(--grid);
+      padding: 2px 4px;
+      text-align: center;
+      min-width: 28px;
+    }
+    td.idx { color: var(--dim); font-size: 9px; }
+    td.mk  { color: var(--accent2); }
+    .col-major td { background: var(--grid); }
+    .lane-head { background: var(--border); color: var(--accent); font-weight: 600; }
+    .chunk2 .lane-head { color: var(--accent2); }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-top: 12px;
+      font-size: 0.8rem;
+      color: var(--dim);
+    }
+    .legend span { display: flex; align-items: center; gap: 6px; }
+    .legend .box { width: 12px; height: 12px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <h1>A (M=16, K=32) non-transpose · doSwizzle 前後 Memory Layout</h1>
+  <p class="sub">Col-major linear = m + 16*k → 依 lane 重排為 new[8*L+i] = old[start_L+i]，start_L = v0 + M*v1，v0/v1 由 nnLaneToV0V1 決定</p>
+
+  <div class="panels">
+    <div class="panel">
+      <h2>Before doSwizzle <span class="formula">linear = m + 16×k</span></h2>
+      <p style="font-size:0.8rem; color: var(--dim); margin:0 0 8px 0;">16×32 矩陣，col-major：先變 m，再變 k。每格 = linear index（hover 顯示 (m,k)）。</p>
+      <div class="grid-wrap" id="before"></div>
+      <div class="legend">
+        <span><span class="box" style="background:#3b3b40;"></span> 同一 column (k)</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>After doSwizzle <span class="formula">new[8×L+i] = old[start_L+i]</span></h2>
+      <p style="font-size:0.8rem; color: var(--dim); margin:0 0 8px 0;">32 lanes × 8 elements × 2 chunks。每格 = 該 linear 位置存的 (m,k)。</p>
+      <div class="grid-wrap" id="after"></div>
+      <div class="legend">
+        <span><span class="box" style="background: var(--accent);"></span> Chunk 0 (0..255)</span>
+        <span><span class="box" style="background: var(--accent2);"></span> Chunk 1 (256..511)</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const M = 16, K = 32;
+
+    // nnLaneToV0V1 (must match SwizzleAGemmRunnerRDNANN.hpp)
+    function nnLaneToV0V1(lane) {
+      const v0 = ((lane >> 3) & 1) * 8;
+      const v1 = ((lane >> 4) & 1) * 8 + (lane & 7);
+      return { v0, v1 };
+    }
+
+    // Build before: 16 rows (m) x 32 cols (k), cell = linear index and (m,k)
+    function buildBefore() {
+      const tbl = document.createElement('table');
+      tbl.className = 'col-major';
+      let header = '<tr><td></td>';
+      for (let k = 0; k < K; k++) header += `<td class="idx">k=${k}</td>`;
+      header += '</tr>';
+      tbl.innerHTML = header;
+      for (let m = 0; m < M; m++) {
+        let row = `<tr><td class="idx">m=${m}</td>`;
+        for (let k = 0; k < K; k++) {
+          const linear = m + M * k;
+          row += `<td title="(m=${m}, k=${k}) linear=${linear}"><span class="idx">${linear}</span></td>`;
+        }
+        row += '</tr>';
+        tbl.insertAdjacentHTML('beforeend', row);
+      }
+      document.getElementById('before').appendChild(tbl);
+    }
+
+    // Build after: for each new linear index, which (m,k) is there?
+    // new[8*L + i] = old[start + i]  with start = v0 + M*v1
+    // old linear = start + i = (v0 + 16*v1) + i  => m + 16*k = v0 + 16*v1 + i  => m = v0+i, k = v1 (first chunk)
+    // Second chunk: old linear = start + 256 + i  => m = v0+i, k = v1 + 16
+    function buildAfter() {
+      const tbl = document.createElement('table');
+      const chunkSize = 256;
+      // Row: lane L, 8 cells for chunk0 then 8 for chunk1
+      let header = '<tr><td class="lane-head">Lane</td>';
+      for (let c = 0; c < 8; c++) header += `<td class="lane-head">+${c}</td>`;
+      for (let c = 0; c < 8; c++) header += `<td class="lane-head">+${c}</td>`;
+      header += '</tr>';
+      tbl.innerHTML = header;
+
+      for (let L = 0; L < 32; L++) {
+        const { v0, v1 } = nnLaneToV0V1(L);
+        const start = v0 + M * v1;
+        let row = `<tr><td class="lane-head">L=${L}</td>`;
+        for (let i = 0; i < 8; i++) {
+          const m = v0 + i, k = v1;
+          row += `<td title="new[${8*L+i}] ← old[${start+i}]" style="background:#2a2a30;"><span class="mk">(${m},${k})</span></td>`;
+        }
+        for (let i = 0; i < 8; i++) {
+          const m = v0 + i, k = v1 + 16;
+          row += `<td class="chunk2" title="new[${256+8*L+i}] ← old[${start+256+i}]" style="background:#1a2a24;"><span class="mk">(${m},${k})</span></td>`;
+        }
+        row += '</tr>';
+        tbl.insertAdjacentHTML('beforeend', row);
+      }
+      document.getElementById('after').appendChild(tbl);
+    }
+
+    buildBefore();
+    buildAfter();
+  </script>
+</body>
+</html>

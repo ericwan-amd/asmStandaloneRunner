@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>doSwizzle: Original vs Swizzled Memory Layout (0–511)</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --card: #18181c;
+      --text: #e4e4e7;
+      --muted: #71717a;
+      --accent: #a78bfa;
+      --accent2: #34d399;
+      --grid-border: #27272a;
+      --cell-hover: #2d2d33;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.5rem 2rem 3rem;
+      min-height: 100vh;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-bottom: 2rem;
+    }
+    .grids {
+      display: flex;
+      gap: 2rem;
+      flex-wrap: wrap;
+      align-items: flex-start;
+    }
+    .panel {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 1rem 1.25rem 1.5rem;
+      border: 1px solid var(--grid-border);
+    }
+    .panel h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 0.75rem 0;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .panel h2 .badge {
+      font-size: 0.7rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
+      font-weight: 400;
+    }
+    .panel.original h2 .badge { background: rgba(52, 211, 153, 0.2); color: var(--accent2); }
+    .panel.swizzled h2 .badge { background: rgba(167, 139, 250, 0.2); color: var(--accent); }
+    .grid-wrap {
+      overflow-x: auto;
+      margin-top: 0.5rem;
+    }
+    table.layout {
+      border-collapse: collapse;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      table-layout: fixed;
+    }
+    table.layout td {
+      border: 1px solid var(--grid-border);
+      padding: 2px 4px;
+      text-align: right;
+      min-width: 22px;
+      max-width: 28px;
+      background: var(--card);
+      color: var(--muted);
+    }
+    table.layout td:hover {
+      background: var(--cell-hover);
+      color: var(--text);
+    }
+    .legend {
+      margin-top: 1rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .legend span { margin-right: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>doSwizzle memory layout</h1>
+  <p class="subtitle">Original 0–511 continuous buffer vs after permute {0,2,3,1,4}. Same 512 elements, different linear order.</p>
+
+  <div class="grids">
+    <div class="panel original">
+      <h2>Original (before doSwizzle) <span class="badge">16×32 row-major</span></h2>
+      <p class="legend"><span>Linear index = row×32 + col. Row 0: 0..31, row 1: 32..63, …</span></p>
+      <div class="grid-wrap" id="original-wrap"></div>
+    </div>
+    <div class="panel swizzled">
+      <h2>After doSwizzle (permute) <span class="badge">content = original index at this new position</span></h2>
+      <p class="legend"><span>Each cell shows which original index now lives here. new_linear = 128×s3 + 8×s1 + s4.</span></p>
+      <div class="grid-wrap" id="swizzled-wrap"></div>
+    </div>
+  </div>
+
+  <script>
+    const ROWS = 16;
+    const COLS = 32;
+
+    // Original: linear index = row * 32 + col
+    function buildOriginalGrid() {
+      let html = '<table class="layout"><tbody>';
+      for (let r = 0; r < ROWS; r++) {
+        html += '<tr>';
+        for (let c = 0; c < COLS; c++) {
+          const linear = r * COLS + c;
+          html += `<td title="row=${r} col=${c} linear=${linear}">${linear}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    // Swizzled: at new position N we have value that was at old position old(N).
+    // new_linear = 128*s3 + 8*s1 + s4  =>  N = 128*s3 + 8*s1 + s4
+    // Inverse: s4 = N%8, t = N>>3, s1 = t%16, s3 = t>>4
+    // old_linear = 32*s1 + 8*s3 + s4
+    function newToOld(newLinear) {
+      const s4 = newLinear % 8;
+      const t = Math.floor(newLinear / 8);
+      const s1 = t % 16;
+      const s3 = Math.floor(t / 16);
+      return 32 * s1 + 8 * s3 + s4;
+    }
+
+    function buildSwizzledGrid() {
+      let html = '<table class="layout"><tbody>';
+      for (let r = 0; r < ROWS; r++) {
+        html += '<tr>';
+        for (let c = 0; c < COLS; c++) {
+          const newLinear = r * COLS + c;
+          const oldLinear = newToOld(newLinear);
+          html += `<td title="new_pos=${newLinear} ← original index ${oldLinear}">${oldLinear}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    document.getElementById('original-wrap').innerHTML = buildOriginalGrid();
+    document.getElementById('swizzled-wrap').innerHTML = buildSwizzledGrid();
+  </script>
+</body>
+</html>

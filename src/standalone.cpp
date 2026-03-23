@@ -34,6 +34,8 @@
 #include "GemmAmaxDRunner.hpp"
 #include "GemmRunner.hpp"
 #include "SwizzleAGemmRunner.hpp"
+#include "SwizzleAGemmRunnerRDNANN.hpp"
+#include "SwizzleAGemmRunnerRDNATN.hpp"
 #include "SwizzleBGemmRunner.hpp"
 
 namespace po = boost::program_options;
@@ -251,6 +253,10 @@ AsmRunnerAndValidator* CreateTypedRunner(po::variables_map& args)
         return new GemmRunner(args, false); // default TN
     else if(test_tag == "swizzleA_gemm")
         return new SwizzleAGemmRunner(args); // Only TN
+    else if(test_tag == "swizzleA_gemm_rdna_tn")
+        return new SwizzleAGemmRunnerRDNATN(args);
+    else if(test_tag == "swizzleA_gemm_rdna_nn")
+        return new SwizzleAGemmRunnerRDNANN(args);
     else if(test_tag == "swizzleB_gemm")
         return new SwizzleBGemmRunner(args); // Only TN
     else

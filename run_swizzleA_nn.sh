@@ -1,0 +1,1 @@
+./asm-runner --runConfig program_config_gemm_swizzleA_rdna_nn.ini --arch gfx1201
