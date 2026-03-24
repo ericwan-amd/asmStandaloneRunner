@@ -47,6 +47,9 @@ private:
     gpubuf_t<_Float16> inputC_d;
     gpubuf_t<_Float16> outputD_d;
 
+    /// From config/CLI `do-swizzle` (1=default): host permute/pad A before H2D; 0=upload raw (K,M) tensor.
+    bool doHostSwizzle_;
+
     size_t Coord2Idx(uint32_t D1, uint32_t D2, size_t idx_1, size_t idx_2)
     {
         return idx_2 * D1 + idx_1;
@@ -114,6 +117,7 @@ private:
 public:
     explicit SwizzleAGemmRunnerRDNATN(po::variables_map const& args)
         : AsmRunnerAndValidator(args)
+        , doHostSwizzle_(args.at("do-swizzle").as<int>() != 0)
     {
     }
 
@@ -169,16 +173,39 @@ public:
         std::cout << std::endl << "Non-Swizzled InputA: (K, M): (" << K << ", " << M << ")" << std::endl;
         print_row_by_row(tensorA_h.as<_Float16>(), K, M, true);
 
-        tn_roctx_push("TN_pre_shuffle_doSwizzle");
-        doSwizzle(tensorA_h, swizzledA_h);
-        tn_roctx_pop();
+        if(doHostSwizzle_)
+        {
+            tn_roctx_push("TN_pre_shuffle_doSwizzle");
+            doSwizzle(tensorA_h, swizzledA_h);
+            tn_roctx_pop();
 
-        std::cout << std::endl << "Swizzled InputA:" << std::endl;
-        Tensor::Manipulation::printTensorDataMultiDims<_Float16>(std::cout, swizzledA_h);
-        std::cout << "swizzledA_h: " << std::endl;
-        Tensor::Manipulation::printTensorData<_Float16>(std::cout, swizzledA_h);
+            std::cout << std::endl << "Swizzled InputA:" << std::endl;
+            Tensor::Manipulation::printTensorDataMultiDims<_Float16>(std::cout, swizzledA_h);
+            std::cout << "swizzledA_h: " << std::endl;
+            Tensor::Manipulation::printTensorData<_Float16>(std::cout, swizzledA_h);
 
-        HIP_CHECK_EXC(inputA_d.alloc(swizzledA_h.getNumBytes()));
+            HIP_CHECK_EXC(inputA_d.alloc(swizzledA_h.getNumBytes()));
+
+            tn_roctx_push("TN_H2D_swizzled_A");
+            HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
+                                    swizzledA_h.as<void>(),
+                                    swizzledA_h.getNumBytes(),
+                                    hipMemcpyHostToDevice));
+            tn_roctx_pop();
+        }
+        else
+        {
+            std::cout << std::endl
+                      << "Host doSwizzle skipped (do-swizzle=0); H2D raw A (K,M) — use no-swizzle kernel .co."
+                      << std::endl;
+            HIP_CHECK_EXC(inputA_d.alloc(tensorA_h.getNumBytes()));
+            tn_roctx_push("TN_H2D_raw_A");
+            HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
+                                    tensorA_h.as<void>(),
+                                    tensorA_h.getNumBytes(),
+                                    hipMemcpyHostToDevice));
+            tn_roctx_pop();
+        }
 
         for(size_t idxB = 0; idxB < inputB_h.size(); ++idxB)
         {
@@ -187,13 +214,6 @@ public:
         }
         std::cout << std::endl << "InputB:" << std::endl;
         print_row_by_row(inputB_h.data(), N, K, false);
-
-        tn_roctx_push("TN_H2D_swizzled_A");
-        HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
-                                swizzledA_h.as<void>(),
-                                swizzledA_h.getNumBytes(),
-                                hipMemcpyHostToDevice));
-        tn_roctx_pop();
         tn_roctx_push("TN_H2D_B_C");
         HIP_CHECK_EXC(hipMemcpy(inputB_d.data(),
                                 inputB_h.data(),

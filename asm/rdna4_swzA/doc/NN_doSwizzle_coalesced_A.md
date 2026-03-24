@@ -5,40 +5,35 @@
 - **doSwizzle** in `SwizzleAGemmRunnerRDNANN.hpp`: pre-shuffle A (M×K col-major) so that after the shuffle, **each lane reads a contiguous 8-element block** and **all lanes’ first 8 elements are stored contiguously** (lane 0, then lane 1, …), then the next 256 elements in the same lane order. That gives **coalesced** global memory access.
 - **NN assembly** `NN_HHS_BH_UserArgs_MT16x16x32_DTVA.s`: when A is swizzled, use **GLOBAL_OFFSET_A_SWZ** so the kernel loads from the new layout (lane-order) correctly.
 
-## 2. Swizzled layout (512 elements)
+## 2. Swizzled layout (512 elements) — **host buffer = row-major 16×32**
 
 **Host A matrix** in `SwizzleAGemmRunnerRDNANN` is stored **column-major** with leading dimension **M=16**:
 
 `linear = m + M*k` → column `k=0` holds rows `m=0..15` at indices `0..15`, column `k=1` at `16..31`, etc.
 
-`SwizzleAGemmRunnerRDNANN::doSwizzle` fills a **16×32** tile in **row-major** order (`dst[r*32+c]`). Each cell’s **source** is `src[V]` where `V` is that element’s col-major linear index:
+**Swizzled buffer** uploaded to the GPU is a **row-major 16×32** tile: `dst[r*32 + c] = src[V(r,c)]`, where `V(r,c)` is the **col-major linear** index into the original `src`:
 
 `V(r,c) = (r/4)*128 + (r%4)*4 + (c/8) + (c%8)*16`
 
-So `dst[r*32+c] = src[V]` with **no** extra remap — `src` is already col-major.
+`hipMemcpy` sends `dst[0..511]` in that linear order. This matches **`NN_HHS_BH_UserArgs_MT16x16x32_DTVA.co`** + `GLOBAL_OFFSET_A_SWZ` in the standalone runner (**validation is the source of truth**).
 
-This matches the spreadsheet layout (stride +16 along 8-wide groups, +4 down within a 4-row band, +128 every 4 rows, +1 per 8-column group).
+**Note:** `NN_doSwizzle_A_layout_visualization.html` uses a **lane-index** story (`new[8*L+i] = old[...]`). That is a useful logical picture of which `(m,k)` each lane touches, but the **physical byte order** expected by the shipped kernel is the **`V(r,c)` row-major pack** above — not a contiguous “lane 0’s 8, then lane 1’s 8, …” `nl` layout (that ordering fails validation).
 
-- **Lane packing:** for M=16,K=32, this row-major order matches **32×8 + 32×8** lane-interleaved packing (`new[8*L+i]` / `new[256+8*L+i]`).
+**Why NN cannot use a generic reshape+permute:** The kernel’s effective addressing into the packed buffer is not a simple `L = 16*k_hi + m` over col-major storage. The explicit `V(r,c)` loop matches what the assembly expects after swizzle.
 
-See also **NN_doSwizzle_A_layout_visualization.html** (older v0/v1 derivation; host now follows the explicit `V(r,c)` grid above).
+## 3. Lane → (v0, v1) in NN kernel (assembly addressing)
 
-**Why NN cannot use a generic reshape+permute:** The kernel’s (v0, v1) is not a simple L = 16\*k_hi + m. E.g. lane 0 reads A(m=0..7, k=0), lane 1 reads A(0..7, k=1), lane 8 reads A(8..15, k=8). A reshape+permute with L = 16\*k_hi + m would give lane 0 = A(0, 0..7), lane 1 = A(1, 0..7), which does not match. So NN doSwizzle must use the **explicit loop** with `nnLaneToV0V1` so that `new[8*L..8*L+7]` = original `[start_L..start_L+7]` with start_L = v0 + M\*v1.
+The NN kernel derives **which original A elements** each lane consumes using `(v0, v1)`:
 
-## 3. Lane → (v0, v1) in NN kernel
-
-The NN kernel computes:
-
-- `start_L = v0(L) + M*v1(L)` (M=16)
-- First load: bytes at `(start_L + 8)*2` (with prepad)
-- Second load: same base + 256 elements → +512 bytes
+- Col-major start (logical): `start_L = v0(L) + M*v1(L)` (M=16)
+- Loads are expressed with **GLOBAL_OFFSET_A_SWZ** and fixed inc (see `.s`): first and second `global_load` hit the correct 8-wide slices of the **packed** buffer.
 
 `(v0, v1)` per lane in the NN assembly (single wave):
 
 - **v0** = `bfe(lane, 3, 1) * 8` → 0 for lane 0..7, 16..23; 8 for 8..15, 24..31
 - **v1** = `(lane/16)*8 + (lane%8)` → 0..7 for lane 0..7 and 8..15; 8..15 for lane 16..23 and 24..31 (matches .s: v4 = v1/16; v4*=8; v1 = (v1&7)+v4)
 
-`doSwizzle` uses the same mapping so that **original** `[start_L .. start_L+7]` and `[start_L+256 .. start_L+263]` are copied to **new** `[L*8 .. L*8+7]` and `[256+L*8 .. 256+L*8+7]`.
+**Host:** `doSwizzle` does **not** write `new[8*L+i]` in lane-linear order; it writes **`dst[r*32+c] = src[V(r,c)]`** so that those assembly offsets read the same logical `A(m,k)` as col-major `src`. The HTML “`new[8*L+i]`” table is still valid as a **logical** `(m,k)` view, not as the memcpy byte order for this `.co`.
 
 ## 4. Host: enable doSwizzle
 

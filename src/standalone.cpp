@@ -27,6 +27,9 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/program_options.hpp>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
 #include "utilities.hpp"
 #include "AMAXRunner.hpp"
@@ -101,6 +104,10 @@ po::options_description all_options()
                 ("bias",                     po::value<float>()->default_value(1.0f), "Bias")
 
                 ("test-tag",                 po::value<std::string>(), "test-tag to find kernel arg and validation funcs")
+
+                ("do-swizzle",               po::value<int>()->default_value(1),
+                 "For swizzleA_gemm_rdna_tn / swizzleA_gemm_rdna_nn: 1=host doSwizzle A then H2D (default); "
+                 "0=upload raw A (row-major M×K for NN) — pair with no-swizzle kernel code object.")
                 ;
     // clang-format on
 
@@ -138,7 +145,9 @@ void LoadCodeObjects(po::variables_map const& args, SolutionAdapter& adapter)
 
     if(filenames.empty())
     {
-        throw;
+        throw std::runtime_error(
+            "No code object files (--code-object / config ini). "
+            "Use --config-file <path.ini> (same as asm-runner), not --runConfig.");
     }
     else
     {
@@ -269,7 +278,20 @@ AsmRunnerAndValidator* CreateTypedRunner(po::variables_map& args)
 
 int main(int argc, const char* argv[])
 {
-    auto args = parse_args(argc, argv);
+    // rocprofv3 invokes:  runner -- --config-file foo.ini
+    // Boost.Program_options treats `--` as "end of options", so --config-file is ignored unless we
+    // drop that separator (same idea as getopt).
+    std::vector<const char*> argv_eff;
+    argv_eff.reserve(static_cast<size_t>(argc));
+    argv_eff.push_back(argv[0]);
+    for(int i = 1; i < argc; ++i)
+    {
+        if(i == 1 && std::strcmp(argv[i], "--") == 0)
+            continue;
+        argv_eff.push_back(argv[i]);
+    }
+
+    auto args = parse_args(static_cast<int>(argv_eff.size()), argv_eff.data());
 
     // Set srand
     // unsigned int seed = args["init-seed"].as<unsigned int>();
