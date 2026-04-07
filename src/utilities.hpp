@@ -19,7 +19,55 @@
 #include "bfloat16.h"
 #include "hipblaslt_float8.h"
 
+#include "SwizzleRdna4Common.hpp"
+
 namespace po = boost::program_options;
+
+/// Shared host **A** indexing + fill patterns for RDNA swizzle TN/NN runners (Tensile-style ramp / random).
+namespace swizzle_rdna_host
+{
+
+/// NN **A** column-major M×K, `lda = M` → `L = m + lda * k`.
+inline size_t linearA_colMajor(uint32_t m, uint32_t k, uint32_t ldaM)
+{
+    return static_cast<size_t>(m) + static_cast<size_t>(ldaM) * static_cast<size_t>(k);
+}
+
+/// TN **A** row-major **K×M** (K rows, M cols): index for row `dimM`, col `dimK` is `dimM * K + dimK` with leading dim K.
+inline size_t linearA_tn_rowMajorKxM(uint32_t dimM, uint32_t dimK, uint32_t K)
+{
+    return static_cast<size_t>(dimM) * static_cast<size_t>(K) + static_cast<size_t>(dimK);
+}
+
+/// Integer ramp `(K * linearM + k) * scale` at each logical `(dimM, dimK)`; `idx(dimM,dimK)` → linear offset in `out`.
+template <typename ADataType, typename IndexFn>
+void fill_inputA_ramp(uint32_t M, uint32_t K, uint32_t minM, ADataType* out, IndexFn&& idx)
+{
+    for(size_t dimM = 0; dimM < M; ++dimM)
+    {
+        size_t scale   = ((dimM / minM) % 2) + 1;
+        size_t linearM = dimM % minM;
+        size_t value   = (static_cast<size_t>(K) * linearM);
+        for(size_t dimK = 0; dimK < K; ++dimK)
+            out[idx(dimM, dimK)]
+                = ADataType(static_cast<float>((value + dimK) * scale));
+    }
+}
+
+/// Tensile-style small-integer random at each `(dimM, dimK)` (see `SwizzleRdna4::tensileRandomInt`).
+template <typename ADataType, typename IndexFn>
+void fill_inputA_random_tensile(uint32_t M, uint32_t K, unsigned seed, ADataType* out, IndexFn&& idx)
+{
+    std::mt19937 gen(seed);
+    for(size_t dimM = 0; dimM < M; ++dimM)
+    {
+        for(size_t dimK = 0; dimK < K; ++dimK)
+            out[idx(dimM, dimK)]
+                = ADataType(static_cast<float>(SwizzleRdna4::tensileRandomInt(gen)));
+    }
+}
+
+} // namespace swizzle_rdna_host
 
 #define HIP_CHECK_EXC(expr)                                                                       \
     do                                                                                            \

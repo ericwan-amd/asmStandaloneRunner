@@ -106,8 +106,18 @@ po::options_description all_options()
                 ("test-tag",                 po::value<std::string>(), "test-tag to find kernel arg and validation funcs")
 
                 ("do-swizzle",               po::value<int>()->default_value(1),
-                 "For swizzleA_gemm_rdna_tn / swizzleA_gemm_rdna_nn: 1=host doSwizzle A then H2D (default); "
-                 "0=upload raw A (row-major M×K for NN) — pair with no-swizzle kernel code object.")
+                 "For swizzleA_gemm_rdna_tn / _tn_f8 / _nn / _nn_f8: 1=host doSwizzle A then H2D (default); "
+                 "0=upload raw A — pair with no-swizzle kernel code object.")
+
+                ("tensor-element-type",      po::value<std::string>()->default_value("fp16"),
+                 "Reserved / unused for RDNA swizzle runners: FP16 vs FP8 is selected by test-tag "
+                 "(swizzleA_gemm_rdna_tn vs swizzleA_gemm_rdna_tn_f8, same for _nn).")
+
+                ("a-init-mode", po::value<std::string>()->default_value("ramp"),
+                 "ramp | random — host init for A (TN/NN). FP8 NN logs use random+seed; FP8 TN logs use ramp.")
+
+                ("a-init-seed", po::value<unsigned>()->default_value(2567u),
+                 "Seed for a-init-mode=random (mt19937). Also passed to srand() for legacy runners.")
                 ;
     // clang-format on
 
@@ -263,9 +273,13 @@ AsmRunnerAndValidator* CreateTypedRunner(po::variables_map& args)
     else if(test_tag == "swizzleA_gemm")
         return new SwizzleAGemmRunner(args); // Only TN
     else if(test_tag == "swizzleA_gemm_rdna_tn")
-        return new SwizzleAGemmRunnerRDNATN(args);
+        return new SwizzleAGemmRunnerRDNATN<_Float16>(args);
+    else if(test_tag == "swizzleA_gemm_rdna_tn_f8")
+        return new SwizzleAGemmRunnerRDNATN<hipblaslt_f8_fnuz>(args);
     else if(test_tag == "swizzleA_gemm_rdna_nn")
-        return new SwizzleAGemmRunnerRDNANN(args);
+        return new SwizzleAGemmRunnerRDNANN<_Float16>(args);
+    else if(test_tag == "swizzleA_gemm_rdna_nn_f8")
+        return new SwizzleAGemmRunnerRDNANN<hipblaslt_f8_fnuz>(args);
     else if(test_tag == "swizzleB_gemm")
         return new SwizzleBGemmRunner(args); // Only TN
     else
@@ -293,17 +307,14 @@ int main(int argc, const char* argv[])
 
     auto args = parse_args(static_cast<int>(argv_eff.size()), argv_eff.data());
 
-    // Set srand
-    // unsigned int seed = args["init-seed"].as<unsigned int>();
-    // if(seed == 0)
-    // {
-    //     seed = time(NULL);
-    // }
-
-    // unsigned int seed = time(NULL);
-    unsigned int seed = 2567;
-    std::cout << std::endl << "srand seed is set to " << seed << std::endl << std::endl;
-    srand(seed);
+    unsigned int seed = args["a-init-seed"].as<unsigned>();
+    std::cout << std::endl
+              << "a-init-seed=" << seed
+              << " -> srand(" << seed << ") for rand()-based runners; TN/NN FP8 random A init uses this seed with "
+                 "mt19937 (Tensile-style distribution, not rand())."
+              << std::endl
+              << std::endl;
+    srand(static_cast<unsigned>(seed));
 
     auto        deviceID = GetHardware(args);
     hipStream_t stream   = GetStream(args);

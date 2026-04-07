@@ -68,6 +68,8 @@ private:
     }
 
     // For TN, the desc.size[0] = K, desc.size[1] = M if A else N (B)
+    // FP16-only path (MiKv=4, PackK=2). RDNA4 gfx12 **F8F8S swizzleA** uses test-tag
+    // swizzleA_gemm_rdna_tn_f8 / _nn_f8 and SwizzleRdna4::tnSlabDoSwizzleF8 — not this runner.
     void doSwizzle(const TensorClass& inBuffer, TensorClass& swizzled)
     {
         // using Tensor = Tensor::Manipulation::Tensor;

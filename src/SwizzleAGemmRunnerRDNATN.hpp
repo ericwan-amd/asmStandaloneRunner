@@ -4,7 +4,10 @@
 //   export ASM_ROCPROF_KERNEL_LOOPS=200
 //   export ASM_ROCPROF_WARMUP=10
 
+#include <algorithm>
 #include <cstdlib>
+#include <string>
+#include <type_traits>
 
 #if defined(ASM_WITH_ROCTX)
 #include <rocprofiler-sdk-roctx/roctx.h>
@@ -12,6 +15,7 @@
 
 #include "utilities.hpp"
 #include "TensorData.hpp"
+#include "SwizzleRdna4Common.hpp"
 
 using TensorClass = Tensor::Manipulation::Tensor;
 
@@ -31,48 +35,58 @@ inline void tn_roctx_pop()
 {}
 #endif
 
+/// GEMM element type **`_Float16`** or **`hipblaslt_f8_fnuz`** for A, B, C, D. Test-tag
+/// `swizzleA_gemm_rdna_tn_f8` vs `swizzleA_gemm_rdna_tn`.
+template <typename ADataType>
 class SwizzleAGemmRunnerRDNATN : public AsmRunnerAndValidator
 {
+    static_assert(std::is_same_v<ADataType, _Float16> || std::is_same_v<ADataType, hipblaslt_f8_fnuz>);
+
 private:
     static const uint32_t minM = 16;
     static const uint32_t minK = 32;
 
-    std::vector<_Float16> inputA_h;
-    std::vector<_Float16> inputB_h;
-    std::vector<_Float16> inputC_h;
-    std::vector<_Float16> outputD_h;
+    bool        doHostSwizzle_;
+    std::string aInitMode_;
+    unsigned    aInitSeed_;
 
-    gpubuf_t<_Float16> inputA_d;
-    gpubuf_t<_Float16> inputB_d;
-    gpubuf_t<_Float16> inputC_d;
-    gpubuf_t<_Float16> outputD_d;
+    std::vector<ADataType> inputA_h;
+    std::vector<ADataType> inputB_h;
+    std::vector<ADataType> inputC_h;
+    std::vector<ADataType> outputD_h;
 
-    /// From config/CLI `do-swizzle` (1=default): host permute/pad A before H2D; 0=upload raw (K,M) tensor.
-    bool doHostSwizzle_;
+    gpubuf_t<ADataType> inputA_d;
+    gpubuf_t<ADataType> inputB_d;
+    gpubuf_t<ADataType> inputC_d;
+    gpubuf_t<ADataType> outputD_d;
 
     size_t Coord2Idx(uint32_t D1, uint32_t D2, size_t idx_1, size_t idx_2)
     {
         return idx_2 * D1 + idx_1;
     }
 
-    template <typename T>
-    void cpuGEMM(T* A, T* B, T* C, T* D)
+    /// Tensile-style reference: `dot = Σ float(a)*float(b)`, then `D = round(alpha*dot + beta*C)`.
+    void cpuGEMM_tensile_ref(ADataType* A, ADataType* B, ADataType* C, ADataType* D)
     {
-        std::cout << "cpuGEMM: (K, M): (" << K << ", " << M << "), (N, K): (" << N << ", " << K << ")" << std::endl;
-        for(auto dx = 0; dx < N; ++dx)
+        std::cout << "cpuGEMM (Tensile Reference: dot then alpha*dot + beta*C): (K, M): (" << K << ", " << M
+                  << "), (N, K): (" << N << ", " << K << ")" << std::endl;
+        for(uint32_t dx = 0; dx < N; ++dx)
         {
-            for(auto dy = 0; dy < M; ++dy)
+            for(uint32_t dy = 0; dy < M; ++dy)
             {
-                float d = 0;
-                for(auto dk = 0; dk < K; ++dk)
+                float dot = 0.f;
+                for(uint32_t dk = 0; dk < K; ++dk)
                 {
-                    auto idx_A = Coord2Idx(K, M, dk, dy);
-                    auto idx_B = Coord2Idx(K, N, dk, dx);
-                    d += alpha * (A[idx_A] * B[idx_B]);
+                    size_t idx_A = Coord2Idx(K, M, dk, dy);
+                    size_t idx_B = Coord2Idx(K, N, dk, dx);
+                    dot += static_cast<float>(A[idx_A]) * static_cast<float>(B[idx_B]);
                 }
-                auto idx_CD = Coord2Idx(M, N, dy, dx);
-                d += beta * C[idx_CD];
-                D[idx_CD] = (T)(d);
+                size_t idx_CD = Coord2Idx(M, N, dy, dx);
+                float  acc    = alpha * dot + beta * static_cast<float>(C[idx_CD]);
+                if constexpr(std::is_same_v<ADataType, _Float16>)
+                    D[idx_CD] = static_cast<_Float16>(acc);
+                else
+                    D[idx_CD] = hipblaslt_f8_fnuz(acc * 2.0f);
             }
         }
     }
@@ -93,31 +107,118 @@ private:
         return true;
     }
 
-    // TN RDNA4: MiKv=8, PackK=1 (see asm/rdna4 doc)
-    void doSwizzle(const TensorClass& inBuffer, TensorClass& swizzled)
+    static void printTensorFlatDecodedF8(std::ostream& os, const TensorClass& tensor)
     {
-        size_t MiM_N = 16, MiK = 16, MiKv = 8, PackK = 1;
-        auto unrolledSize = inBuffer.getDesc().getShape()[0];
-        auto tiledSize    = inBuffer.getDesc().getShape()[1];
-        ::Tensor::Manipulation::Shape paddedShape{ ((tiledSize / MiM_N) + !!(tiledSize % MiM_N)) * MiM_N,
-                                                   (unrolledSize / (MiK * PackK) + !!(unrolledSize % (MiK * PackK))) * MiK * PackK};
-        auto tmpTensor = TensorClass({tiledSize, unrolledSize}, inBuffer.getElementSize());
-        memcpy(tmpTensor.as<void>(), inBuffer.as<void>(), tmpTensor.getNumBytes());
-        uint64_t padVal{};
-        auto     paddedTensor = ::Tensor::Manipulation::pad(tmpTensor, paddedShape, &padVal, tmpTensor.getElementSize());
-        paddedTensor.reshape({paddedShape[0] / MiM_N,
-                              MiM_N,
-                              paddedShape[1] / (MiK * PackK),
-                              MiK / MiKv,
-                              MiKv * PackK});
+        const uint8_t* d = tensor.as<uint8_t>();
+        size_t         n = tensor.getDesc().flattenSize();
+        os << "[";
+        for(size_t i = 0; i < n; ++i)
+            os << SwizzleRdna4::f8uToFloat(d[i]) << ", ";
+        os << "]\n";
+    }
 
-        swizzled = permute(paddedTensor, {0, 2, 3, 1, 4});
+    /// Build host **A** (K×M), optional TN slab swizzle, **H2D** → `inputA_d`. FP16 ignores `a-init-mode=random`.
+    void tnHostPrepareAndUploadA()
+    {
+        TensorClass tensorA_h({K, M}, sizeof(ADataType));
+        TensorClass swizzledA_h = [&] {
+            if constexpr(std::is_same_v<ADataType, _Float16>)
+                return TensorClass({K, M}, sizeof(_Float16));
+            else
+                return TensorClass({1}, 1u);
+        }();
+
+        outputD_h.assign(static_cast<size_t>(M * N), ADataType{});
+        HIP_CHECK_EXC(outputD_d.alloc(sizeof(ADataType) * M * N));
+        inputA_h.assign(static_cast<size_t>(M * K), ADataType{});
+
+        auto idxTn = [this](size_t dimM, size_t dimK) {
+            return swizzle_rdna_host::linearA_tn_rowMajorKxM(
+                static_cast<uint32_t>(dimM), static_cast<uint32_t>(dimK), K);
+        };
+        if constexpr(std::is_same_v<ADataType, _Float16>)
+            swizzle_rdna_host::fill_inputA_ramp(M, K, minM, inputA_h.data(), idxTn);
+        else if(aInitMode_ == "random")
+            swizzle_rdna_host::fill_inputA_random_tensile(M, K, aInitSeed_, inputA_h.data(), idxTn);
+        else
+            swizzle_rdna_host::fill_inputA_ramp(M, K, minM, inputA_h.data(), idxTn);
+
+        memcpy(tensorA_h.as<void>(), inputA_h.data(), tensorA_h.getNumBytes());
+
+        std::cout << std::endl << "Non-Swizzled InputA: (K, M): (" << K << ", " << M << ")";
+        if constexpr(!std::is_same_v<ADataType, _Float16>)
+        {
+            std::cout << ", A init: ";
+            if(aInitMode_ == "random")
+                std::cout << "Tensile-style Random; seed=" << aInitSeed_ << std::endl;
+            else
+                std::cout << "integer ramp (K * linearM + k) * scale" << std::endl;
+        }
+        else
+            std::cout << std::endl;
+        print_row_by_row(inputA_h.data(), K, M, true);
+
+        if constexpr(!std::is_same_v<ADataType, _Float16>)
+        {
+            std::cout << "Non-Swizzled InputA storage hex (row-major K×M, same cell order as float print above):"
+                      << std::endl;
+            SwizzleRdna4::printBufferHex(std::cout, inputA_h.data(), inputA_h.size());
+        }
+
+        if(doHostSwizzle_)
+        {
+            if constexpr(std::is_same_v<ADataType, _Float16>)
+            {
+                tn_roctx_push("TN_pre_shuffle_doSwizzleFp16");
+                SwizzleRdna4::tnSlabDoSwizzleFp16(tensorA_h, swizzledA_h);
+                tn_roctx_pop();
+                std::cout << std::endl << "Swizzled InputA:" << std::endl;
+                Tensor::Manipulation::printTensorDataMultiDims<_Float16>(std::cout, swizzledA_h);
+                std::cout << "swizzledA_h: " << std::endl;
+                Tensor::Manipulation::printTensorData<_Float16>(std::cout, swizzledA_h);
+            }
+            else
+            {
+                tn_roctx_push("TN_pre_shuffle_doSwizzleF8");
+                SwizzleRdna4::tnSlabDoSwizzleF8(tensorA_h, swizzledA_h);
+                tn_roctx_pop();
+                std::cout << std::endl
+                          << "Swizzled InputA (RM 16×32 per tile; segment interleave top/bottom rows):"
+                          << std::endl;
+                printTensorFlatDecodedF8(std::cout, swizzledA_h);
+                std::cout << "swizzledA_h: " << std::endl;
+                printTensorFlatDecodedF8(std::cout, swizzledA_h);
+                std::cout << "Swizzled A linear storage hex (" << swizzledA_h.getDesc().flattenSize()
+                          << " elements)" << std::endl;
+                SwizzleRdna4::printBufferHex(std::cout, swizzledA_h.as<void>(), swizzledA_h.getNumBytes());
+            }
+            HIP_CHECK_EXC(inputA_d.alloc(swizzledA_h.getNumBytes()));
+            tn_roctx_push("TN_H2D_swizzled_A");
+            HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
+                                    swizzledA_h.as<void>(),
+                                    swizzledA_h.getNumBytes(),
+                                    hipMemcpyHostToDevice));
+            tn_roctx_pop();
+        }
+        else
+        {
+            std::cout << std::endl
+                      << "Host doSwizzle skipped (do-swizzle=0); H2D raw A (K,M) — use no-swizzle kernel .co."
+                      << std::endl;
+            HIP_CHECK_EXC(inputA_d.alloc(tensorA_h.getNumBytes()));
+            tn_roctx_push("TN_H2D_raw_A");
+            HIP_CHECK_EXC(hipMemcpy(
+                inputA_d.data(), tensorA_h.as<void>(), tensorA_h.getNumBytes(), hipMemcpyHostToDevice));
+            tn_roctx_pop();
+        }
     }
 
 public:
     explicit SwizzleAGemmRunnerRDNATN(po::variables_map const& args)
         : AsmRunnerAndValidator(args)
         , doHostSwizzle_(args.at("do-swizzle").as<int>() != 0)
+        , aInitMode_(args.at("a-init-mode").as<std::string>())
+        , aInitSeed_(args.at("a-init-seed").as<unsigned>())
     {
     }
 
@@ -148,80 +249,29 @@ public:
 
     virtual void SetupKernelArgs(KernelInvocation& kernelInvoc) override
     {
-        TensorClass tensorA_h = TensorClass({K, M}, sizeof(_Float16));
-        TensorClass swizzledA_h = TensorClass({K, M}, sizeof(_Float16));
+        inputB_h = std::vector<ADataType>(N * K, ADataType(1.0f));
+        inputC_h = std::vector<ADataType>(M * N, ADataType(0.0f));
+        HIP_CHECK_EXC(inputB_d.alloc(sizeof(ADataType) * N * K));
+        HIP_CHECK_EXC(inputC_d.alloc(sizeof(ADataType) * M * N));
 
-        inputA_h  = std::vector<_Float16>();
-        inputB_h  = std::vector<_Float16>(N * K, (_Float16)1.0f);
-        inputC_h  = std::vector<_Float16>(M * N, (_Float16)0.0f);
-        outputD_h = std::vector<_Float16>(M * N, (_Float16)0.0f);
-
-        HIP_CHECK_EXC(inputB_d.alloc(sizeof(_Float16) * N * K));
-        HIP_CHECK_EXC(inputC_d.alloc(sizeof(_Float16) * M * N));
-        HIP_CHECK_EXC(outputD_d.alloc(sizeof(_Float16) * M * N));
-
-        size_t value = 0;
-        for(size_t dimM = 0; dimM < M; ++dimM)
-        {
-            size_t scale   = ((dimM / minM) % 2) + 1;
-            size_t linearM = dimM % minM;
-            value          = (K * linearM);
-            for(size_t dimK = 0; dimK < K; ++dimK)
-                inputA_h.push_back((value + dimK) * scale);
-        }
-        memcpy(tensorA_h.as<void>(), inputA_h.data(), tensorA_h.getNumBytes());
-        std::cout << std::endl << "Non-Swizzled InputA: (K, M): (" << K << ", " << M << ")" << std::endl;
-        print_row_by_row(tensorA_h.as<_Float16>(), K, M, true);
-
-        if(doHostSwizzle_)
-        {
-            tn_roctx_push("TN_pre_shuffle_doSwizzle");
-            doSwizzle(tensorA_h, swizzledA_h);
-            tn_roctx_pop();
-
-            std::cout << std::endl << "Swizzled InputA:" << std::endl;
-            Tensor::Manipulation::printTensorDataMultiDims<_Float16>(std::cout, swizzledA_h);
-            std::cout << "swizzledA_h: " << std::endl;
-            Tensor::Manipulation::printTensorData<_Float16>(std::cout, swizzledA_h);
-
-            HIP_CHECK_EXC(inputA_d.alloc(swizzledA_h.getNumBytes()));
-
-            tn_roctx_push("TN_H2D_swizzled_A");
-            HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
-                                    swizzledA_h.as<void>(),
-                                    swizzledA_h.getNumBytes(),
-                                    hipMemcpyHostToDevice));
-            tn_roctx_pop();
-        }
-        else
-        {
-            std::cout << std::endl
-                      << "Host doSwizzle skipped (do-swizzle=0); H2D raw A (K,M) — use no-swizzle kernel .co."
-                      << std::endl;
-            HIP_CHECK_EXC(inputA_d.alloc(tensorA_h.getNumBytes()));
-            tn_roctx_push("TN_H2D_raw_A");
-            HIP_CHECK_EXC(hipMemcpy(inputA_d.data(),
-                                    tensorA_h.as<void>(),
-                                    tensorA_h.getNumBytes(),
-                                    hipMemcpyHostToDevice));
-            tn_roctx_pop();
-        }
+        tnHostPrepareAndUploadA();
 
         for(size_t idxB = 0; idxB < inputB_h.size(); ++idxB)
         {
-            auto rowID     = idxB % K;
-            inputB_h[idxB] = (rowID % 3 == 2) ? 0 : 1;
+            auto rowID = idxB % K;
+            inputB_h[idxB]
+                = (rowID % 3 == 2) ? ADataType(0.0f) : ADataType(1.0f);
         }
         std::cout << std::endl << "InputB:" << std::endl;
         print_row_by_row(inputB_h.data(), N, K, false);
         tn_roctx_push("TN_H2D_B_C");
         HIP_CHECK_EXC(hipMemcpy(inputB_d.data(),
                                 inputB_h.data(),
-                                sizeof(_Float16) * inputB_h.size(),
+                                sizeof(ADataType) * inputB_h.size(),
                                 hipMemcpyHostToDevice));
         HIP_CHECK_EXC(hipMemcpy(inputC_d.data(),
                                 inputC_h.data(),
-                                sizeof(_Float16) * inputC_h.size(),
+                                sizeof(ADataType) * inputC_h.size(),
                                 hipMemcpyHostToDevice));
         tn_roctx_pop();
 
@@ -238,9 +288,10 @@ public:
         kernelArg.append("SizesFree2", (uint32_t)1);
         kernelArg.append("SizesSum0", K);
 
-        kernelArg.append("D", outputD_d.data());
-        kernelArg.append("C", inputC_d.data());
-        kernelArg.append("A", inputA_d.data());
+        // Same pointer order as SwizzleAGemmRunner / GemmRunner: D, C, A, B (BH_UserArgs ABI).
+        kernelArg.append("D", static_cast<void*>(outputD_d.data()));
+        kernelArg.append("C", static_cast<void*>(inputC_d.data()));
+        kernelArg.append("A", static_cast<void*>(inputA_d.data()));
         kernelArg.append("B", inputB_d.data());
 
         kernelArg.append("strideD0", M);
@@ -267,23 +318,75 @@ public:
             float err  = refV - gpuV;
             if(std::isnan(gpuV) || std::isinf(gpuV))
                 return false;
-            maxErr = max(maxErr, abs(err));
+            maxErr = std::max(maxErr, std::abs(err));
         }
 
         std::cout << "max error : " << maxErr << std::endl;
         return (maxErr == 0.0f) && !std::isnan(maxErr) && !std::isinf(maxErr);
     }
 
+    bool compare_fp8(const std::vector<hipblaslt_f8_fnuz>& gpuOutput,
+                     const std::vector<hipblaslt_f8_fnuz>& ref)
+    {
+        size_t bad    = 0;
+        float  maxAbs = 0.f;
+        float  maxRat = 0.f;
+        for(size_t i = 0; i < ref.size(); ++i)
+        {
+            float a = static_cast<float>(ref[i]);
+            float b = static_cast<float>(gpuOutput[i]);
+            float e = std::fabs(a - b);
+            maxAbs  = std::max(maxAbs, e);
+            float den = std::fabs(a) + std::fabs(b) + 1.f;
+            if(den > 0.f)
+                maxRat = std::max(maxRat, e / den);
+            if(!SwizzleRdna4::almostEqualF8(ref[i].data, gpuOutput[i].data, nullptr))
+                ++bad;
+        }
+        std::cout << "Validation vs tensilelite Reference.hpp AlmostEqual (Float8_fnuz tol=0.125×(|a|+|b|+1)):"
+                  << std::endl;
+        std::cout << "  mismatched elements: " << bad << " / " << ref.size() << std::endl;
+        std::cout << "  max |ref-gpu| (float decode): " << maxAbs << std::endl;
+        std::cout << "  max |ref-gpu|/(|ref|+|gpu|+1): " << maxRat
+                  << " (Tensile allows < 0.125)" << std::endl;
+        if(bad != 0)
+        {
+            std::cout << "Why non-zero: A,B are FP8 (or FP16); inner products use float math with different\n"
+                      << "  accumulation order (CPU sequential vs GPU WMMA tree), then final D rounds to E4M3 "
+                         "— so decoded float rarely matches bit-exact."
+                      << std::endl;
+        }
+        return bad == 0;
+    }
+
     virtual bool Validation() override
     {
         std::cout << std::endl << "Validation:" << std::endl;
 
-        cpuGEMM(inputA_h.data(), inputB_h.data(), inputC_h.data(), outputD_h.data());
+        if constexpr(!std::is_same_v<ADataType, _Float16>)
+        {
+            cpuGEMM_tensile_ref(inputA_h.data(), inputB_h.data(), inputC_h.data(), outputD_h.data());
+            std::cout << std::endl << "Ref:" << std::endl;
+            print_row_by_row(outputD_h.data(), N, M, false);
+
+            std::vector<hipblaslt_f8_fnuz> gpuOutput(M * N);
+            HIP_CHECK_EXC(hipMemcpy(gpuOutput.data(),
+                                    outputD_d.data(),
+                                    sizeof(hipblaslt_f8_fnuz) * gpuOutput.size(),
+                                    hipMemcpyDeviceToHost));
+            std::cout << std::endl << "Kernel Result:" << std::endl;
+            print_row_by_row(gpuOutput.data(), N, M, false);
+
+            return compare_fp8(gpuOutput, outputD_h);
+        }
+
+        cpuGEMM_tensile_ref(inputA_h.data(), inputB_h.data(), inputC_h.data(), outputD_h.data());
         std::cout << std::endl << "Ref:" << std::endl;
         print_row_by_row(outputD_h.data(), N, M, false);
 
-        std::vector<_Float16> gpuOutput(M * N);
-        HIP_CHECK_EXC(hipMemcpy(gpuOutput.data(), outputD_d.data(), outputD_d.size(), hipMemcpyDeviceToHost));
+        std::vector<ADataType> gpuOutput(M * N);
+        HIP_CHECK_EXC(hipMemcpy(
+            gpuOutput.data(), outputD_d.data(), sizeof(ADataType) * gpuOutput.size(), hipMemcpyDeviceToHost));
         std::cout << std::endl << "Kernel Result:" << std::endl;
         print_row_by_row(gpuOutput.data(), N, M, false);
 
