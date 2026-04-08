@@ -305,12 +305,18 @@ label_ASM_Start:  /// Main body of the asm kernel
 /******************************************/
 .set Srd127_96, 0x30020000
 
-/* Global Offset A */
+/* Global Offset A (no doSwizzle): per-lane element offset, +8 prepad, bpe=1 */
 .macro GLOBAL_OFFSET_A vgprAddr:req, vgprOffsetL:req, vgprOffset0I:req, vgprTmp:req
     v_mul_lo_u32 v[\vgprTmp+0], s[sgprStrideA0I], v[\vgprOffset0I] // mul d1 lower
     v_add_co_u32 v[\vgprAddr+0], vcc_lo, v[\vgprOffsetL], v[\vgprTmp+0] // accumulate K lower
     v_add_nc_u32 v[\vgprAddr+0], 0x8, v[\vgprAddr+0]   // add prepad for pointer shift
                                                        // offset *= bytes/element (multiplier is 1, do nothing)
+.endm
+/* Global Offset A for host doSwizzle (RM 16×32 fp8 slab): lane L reads 16 contiguous bytes at byte lane*16+8 from SRD (coalesced b128) */
+.macro GLOBAL_OFFSET_A_SWZ vgprAddr:req, vgprTmp:req
+    v_and_b32 v[\vgprTmp+0], 31, v[vgprSerial]        // lane = tid % 32
+    v_lshlrev_b32 v[\vgprAddr+0], 4, v[\vgprTmp+0]    // byte offset = lane*16
+    v_add_nc_u32 v[\vgprAddr+0], 0x8, v[\vgprAddr+0]  // add prepad for pointer shift
 .endm
 
 /* Global Offset B */
@@ -1202,10 +1208,9 @@ s_addc_u32 s[sgprSrdB+1], s[sgprAddressB+1], s19   // SRD base = Address+ tileSt
 s_mov_b32 s[sgprSrdB+3], Srd127_96                 // Set bits 127_96 in SRD
 
 /* global read addresses: final offsets a */
-GLOBAL_OFFSET_A vgprGlobalReadOffsetA+0,  1,  0, 12 // gROA_0_0_0_0
-s_mul_i32 s[sgprScalarGlobalReadOffsetA+0], s[sgprStrideA0I], 0 // compute offset diff (scaled tileDim)
-s_add_u32 s[sgprScalarGlobalReadOffsetA+0], s[sgprScalarGlobalReadOffsetA+0], 16 // compute offset diff (unrollDim)
-                                                   // scalar offset *= bytes/element (multiplier is 1, do nothing)
+/* doSwizzle: coalesced b128 per lane; byte offset = lane*16 + 8 (prepad) */
+GLOBAL_OFFSET_A_SWZ vgprGlobalReadOffsetA+0, 12
+s_mov_b32 s[sgprScalarGlobalReadOffsetA+0], 0      // swizzle path: no 2nd A scalar offset
 
 /* global read addresses: final offsets b */
 /* ============================================================= */
@@ -1339,8 +1344,7 @@ s_cmp_eq_u32 s[sgprLoopCounterL], 0                // at last iteration?
 s_cbranch_scc1 label_ShadowInitStart               // skip to ShadowInitStart iter b/c numIter==0
 buffer_load_b64 v[vgprG2LB+0:vgprG2LB+0+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], null offen offset:0 // G -> Reg 0_0_0_0
 buffer_load_b64 v[vgprG2LB+2:vgprG2LB+2+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+0] offen offset:0 // G -> Reg 0_0_1_0
-buffer_load_b64 v[vgprG2LA+0:vgprG2LA+0+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0
-buffer_load_b64 v[vgprG2LA+2:vgprG2LA+2+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 // G -> Reg 1_0_0_0
+buffer_load_b128 v[vgprG2LA+0:vgprG2LA+0+3], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0 (16×fp8 coalesced swizzle)
 
 /* global read inc A loopL */
 s_add_u32 s18, s[sgprLoopCounterL], 1              // remove pf(1)
@@ -1450,7 +1454,7 @@ s_add_u32 s68, s68, s70                            // add target branch offset
 s_addc_u32 s69, s69, 0                             // add high and carry
 s_setpc_b64 s[68:69]                               // branch to label_PrefetchGlobalLastIterEnd
 label_NoBranch_T8JHFHKM7BO5OHXW:
-s_wait_loadcnt 2                                   // wait for global read
+s_wait_loadcnt 1                                   // wait for B global reads (1 A load still outstanding)
 
 /* local write a */
 
@@ -1500,8 +1504,7 @@ ds_load_b64 v[vgprValuB_X1_I0+0:vgprValuB_X1_I0+0+1], v[vgprLocalReadAddrB] offs
 /* localReadsVacancy: latencyLeft 3 */
 buffer_load_b64 v[vgprG2LB+0:vgprG2LB+0+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], null offen offset:0 // G -> Reg 0_0_0_0
 buffer_load_b64 v[vgprG2LB+2:vgprG2LB+2+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+0] offen offset:0 // G -> Reg 0_0_1_0
-buffer_load_b64 v[vgprG2LA2+0:vgprG2LA2+0+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0
-buffer_load_b64 v[vgprG2LA2+2:vgprG2LA2+2+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 // G -> Reg 1_0_0_0
+buffer_load_b128 v[vgprG2LA2+0:vgprG2LA2+0+3], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0 (16×fp8 coalesced swizzle)
 
 /* global read inc A loopL */
 s_cmp_eq_u32 s[sgprLoopCounterL], s[sgprStaggerUIter] // Is this the wrapIter?
@@ -1522,10 +1525,10 @@ s_add_u32 s[sgprSrdB+0], s[sgprSrdB+0], s68        // gra SRD += inc(lower)
 s_addc_u32 s[sgprSrdB+1], s[sgprSrdB+1], s69       // gra SRD += inc(upper)
 s_sub_u32 s[sgprShadowLimitB+0], s[sgprShadowLimitB+0], s68 // limit -= inc)
 /* sched write - iter 0 writesPerItem=1 */
-s_wait_loadcnt 3                                   // wait for global read before writing to local
+s_wait_loadcnt 2                                   // wait for B global read before writing to local (outstanding: 2B+1A→wait 2 leaves 1A)
 ds_store_b64 v[vgprLocalWriteAddrB], v[vgprG2LB+0:vgprG2LB+0+1] offset:0 // lwoB_0_0_0_0 = (0*LSCB)*(MT1J+PAD) + (0*LSPB) = 0
 /* sched write - iter 0 writesPerItem=1 */
-s_wait_loadcnt 2                                   // wait for global read before writing to local
+s_wait_loadcnt 1                                   // wait for B global read before writing to local
 ds_store_b64 v[vgprLocalWriteAddrB], v[vgprG2LB+2:vgprG2LB+2+1] offset:272 // lwoB_0_0_1_0 = (0*LSCB)*(MT1J+PAD) + (1*LSPB) = 272
 
 /* local write swap offsets a */
@@ -1589,8 +1592,7 @@ ds_load_b64 v[vgprValuB_X1_I0+0:vgprValuB_X1_I0+0+1], v[vgprLocalReadAddrB] offs
 /* localReadsVacancy: latencyLeft 3 */
 buffer_load_b64 v[vgprG2LB+0:vgprG2LB+0+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], null offen offset:0 // G -> Reg 0_0_0_0
 buffer_load_b64 v[vgprG2LB+2:vgprG2LB+2+1], v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+0] offen offset:0 // G -> Reg 0_0_1_0
-buffer_load_b64 v[vgprG2LA+0:vgprG2LA+0+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0
-buffer_load_b64 v[vgprG2LA+2:vgprG2LA+2+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 // G -> Reg 1_0_0_0
+buffer_load_b128 v[vgprG2LA+0:vgprG2LA+0+3], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:0 // G -> Reg 0_0_0_0 (16×fp8 coalesced swizzle)
 
 /* global read inc A loopL */
 s_cmp_eq_u32 s[sgprLoopCounterL], s[sgprStaggerUIter] // Is this the wrapIter?
@@ -1611,10 +1613,10 @@ s_add_u32 s[sgprSrdB+0], s[sgprSrdB+0], s68        // gra SRD += inc(lower)
 s_addc_u32 s[sgprSrdB+1], s[sgprSrdB+1], s69       // gra SRD += inc(upper)
 s_sub_u32 s[sgprShadowLimitB+0], s[sgprShadowLimitB+0], s68 // limit -= inc)
 /* sched write - iter 0 writesPerItem=1 */
-s_wait_loadcnt 3                                   // wait for global read before writing to local
+s_wait_loadcnt 2                                   // wait for B global read before writing to local (outstanding: 2B+1A→wait 2 leaves 1A)
 ds_store_b64 v[vgprLocalWriteAddrB], v[vgprG2LB+0:vgprG2LB+0+1] offset:0 // lwoB_0_0_0_0 = (0*LSCB)*(MT1J+PAD) + (0*LSPB) = 0
 /* sched write - iter 0 writesPerItem=1 */
-s_wait_loadcnt 2                                   // wait for global read before writing to local
+s_wait_loadcnt 1                                   // wait for B global read before writing to local
 ds_store_b64 v[vgprLocalWriteAddrB], v[vgprG2LB+2:vgprG2LB+2+1] offset:272 // lwoB_0_0_1_0 = (0*LSCB)*(MT1J+PAD) + (1*LSPB) = 272
 
 /* local write swap offsets a */
@@ -2141,30 +2143,30 @@ v_or_b32 v[vgprG2LA+0+1], v[vgprG2LA+0+1], v36     // pack a sub 8-bit with dest
 s_wait_loadcnt 0
 v_lshlrev_b32 v37, 0x8, v37                        // shift left to higher 8 bits
 v_or_b32 v[vgprG2LA+0+1], v[vgprG2LA+0+1], v37     // pack a sub 8-bit with dest
-/* g2l=2, load component 0 */
+/* g2l=2, load component 0 — swizzle: 2nd 8 bytes contiguous at +8 from same base */
 v_mov_b32 v[vgprG2LA+2+0], 0                       // set to zero to avoid unexpected value
-buffer_load_d16_u8 v[vgprG2LA+2+0], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 // load one buffer value
+buffer_load_d16_u8 v[vgprG2LA+2+0], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:8 // load one buffer value
 /* g2l=2, load component 1 */
 v_mov_b32 v31, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_u8 v31, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:1 // load one buffer value
+buffer_load_d16_u8 v31, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:9 // load one buffer value
 /* g2l=2, load component 2 */
 v_mov_b32 v32, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_hi_u8 v32, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:2 // load one buffer value
+buffer_load_d16_hi_u8 v32, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:10 // load one buffer value
 /* g2l=2, load component 3 */
 v_mov_b32 v33, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_hi_u8 v33, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:3 // load one buffer value
+buffer_load_d16_hi_u8 v33, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:11 // load one buffer value
 /* g2l=2, load component 4 */
 v_mov_b32 v[vgprG2LA+2+1], 0                       // set to zero to avoid unexpected value
-buffer_load_d16_u8 v[vgprG2LA+2+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:4 // load one buffer value
+buffer_load_d16_u8 v[vgprG2LA+2+1], v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:12 // load one buffer value
 /* g2l=2, load component 5 */
 v_mov_b32 v35, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_u8 v35, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:5 // load one buffer value
+buffer_load_d16_u8 v35, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:13 // load one buffer value
 /* g2l=2, load component 6 */
 v_mov_b32 v36, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_hi_u8 v36, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:6 // load one buffer value
+buffer_load_d16_hi_u8 v36, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:14 // load one buffer value
 /* g2l=2, load component 7 */
 v_mov_b32 v37, 0                                   // set to zero to avoid unexpected value
-buffer_load_d16_hi_u8 v37, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:7 // load one buffer value
+buffer_load_d16_hi_u8 v37, v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], null offen offset:15 // load one buffer value
 s_wait_loadcnt 6
 v_lshlrev_b32 v31, 0x8, v31                        // shift left to higher 8 bits
 v_or_b32 v[vgprG2LA+2+0], v[vgprG2LA+2+0], v31     // pack a sub 8-bit with dest

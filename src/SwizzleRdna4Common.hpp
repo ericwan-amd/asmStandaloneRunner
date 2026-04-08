@@ -55,12 +55,12 @@ inline void tnSlabDoSwizzle(const TensorClass& inBuffer, TensorClass& swizzled)
     swizzled = ::Tensor::Manipulation::permute(paddedTensor, {0, 2, 3, 1, 4});
 }
 
-/// **TN FP8 slab (device as RM 16×32):** same padded RM **(M, K)** tile as FP16 staging, then for
-/// each **512** elements (one 16×32 tile), walk source **row-major** linear `i = 0..511`.
-/// Partition into **64-element groups** `g = 0..7`. Within each group, four **16**-element runs
-/// split: **first 8** go to **top** row `g` (cols 0–7, 8–15, 16–23, 24–31 by quarter), **last 8**
-/// to **bottom** row `g + 8` at the same column bands — i.e. every 16 in linear order: upper
-/// slab / lower slab at matching columns (matches the FP8 layout figure / ramp 0..511 grid).
+/// **TN FP8 slab (RM 16×32, one tile = 512 bytes):** swizzle **target differs from FP16**.
+/// FP16 TN uses `permute({0,2,3,1,4})` so each lane’s **8 half** fit **two** global reads (8 + skip
+/// slab + 8). FP8 DTVA uses **one** `buffer_load_b128` per lane (**16×fp8** contiguous); host must
+/// pre-shuffle so those 16 bytes are adjacent in device order — the **pre-shuffle chunk** layout
+/// (e.g. row0: [0–7][16–23][32–39][48–55], later row: [8–15][24–31]…) is implemented by the
+/// scatter below, **not** by reusing `tnSlabDoSwizzle`.
 inline void tnSlabDoSwizzleF8(const TensorClass& inBuffer, TensorClass& swizzled)
 {
     assert(inBuffer.getElementSize() == 1 && "RDNA4 F8 swizzle: each tensor element must be 1 byte (e.g. hipblaslt_f8_fnuz)");
@@ -106,7 +106,25 @@ inline void tnSlabDoSwizzleF8(const TensorClass& inBuffer, TensorClass& swizzled
 inline void tnSlabDoSwizzleFp16(const TensorClass& inBuffer, TensorClass& swizzled)
 {
     assert(inBuffer.getElementSize() == sizeof(uint16_t) && "RDNA4 FP16 swizzle expects 2-byte elements");
-    tnSlabDoSwizzle(inBuffer, swizzled);
+    // tnSlabDoSwizzle(inBuffer, swizzled);
+    size_t MiM_N = 16, MiK = 16, MiKv = 8, PackK = 1;
+    auto   unrolledSize = inBuffer.getDesc().getShape()[0];
+    auto   tiledSize    = inBuffer.getDesc().getShape()[1];
+    ::Tensor::Manipulation::Shape paddedShape{
+        ((tiledSize / MiM_N) + !!(tiledSize % MiM_N)) * MiM_N,
+        (unrolledSize / (MiK * PackK) + !!(unrolledSize % (MiK * PackK))) * MiK * PackK};
+    auto tmpTensor = TensorClass({tiledSize, unrolledSize}, inBuffer.getElementSize());
+    memcpy(tmpTensor.as<void>(), inBuffer.as<void>(), tmpTensor.getNumBytes());
+    uint64_t padVal{};
+    auto     paddedTensor
+        = ::Tensor::Manipulation::pad(tmpTensor, paddedShape, &padVal, tmpTensor.getElementSize());
+    paddedTensor.reshape({paddedShape[0] / MiM_N,
+                          MiM_N,
+                          paddedShape[1] / (MiK * PackK),
+                          MiK / MiKv,
+                          MiKv * PackK});
+
+    swizzled = ::Tensor::Manipulation::permute(paddedTensor, {0, 2, 3, 1, 4});
 }
 
 /// Tensile-style small integer draws for host tensors (matches typical client tests).

@@ -121,12 +121,13 @@ private:
     void tnHostPrepareAndUploadA()
     {
         TensorClass tensorA_h({K, M}, sizeof(ADataType));
-        TensorClass swizzledA_h = [&] {
-            if constexpr(std::is_same_v<ADataType, _Float16>)
-                return TensorClass({K, M}, sizeof(_Float16));
-            else
-                return TensorClass({1}, 1u);
-        }();
+        // TensorClass swizzledA_h = [&] {
+        //     if constexpr(std::is_same_v<ADataType, _Float16>)
+        //         return TensorClass({K, M}, sizeof(_Float16));
+        //     else
+        //         return TensorClass({1}, 1u);
+        // }();
+        TensorClass swizzledA_h{{K, M}, sizeof(ADataType)};
 
         outputD_h.assign(static_cast<size_t>(M * N), ADataType{});
         HIP_CHECK_EXC(outputD_d.alloc(sizeof(ADataType) * M * N));
@@ -136,26 +137,15 @@ private:
             return swizzle_rdna_host::linearA_tn_rowMajorKxM(
                 static_cast<uint32_t>(dimM), static_cast<uint32_t>(dimK), K);
         };
-        if constexpr(std::is_same_v<ADataType, _Float16>)
-            swizzle_rdna_host::fill_inputA_ramp(M, K, minM, inputA_h.data(), idxTn);
-        else if(aInitMode_ == "random")
+
+        if(aInitMode_ == "random")
             swizzle_rdna_host::fill_inputA_random_tensile(M, K, aInitSeed_, inputA_h.data(), idxTn);
         else
             swizzle_rdna_host::fill_inputA_ramp(M, K, minM, inputA_h.data(), idxTn);
 
         memcpy(tensorA_h.as<void>(), inputA_h.data(), tensorA_h.getNumBytes());
 
-        std::cout << std::endl << "Non-Swizzled InputA: (K, M): (" << K << ", " << M << ")";
-        if constexpr(!std::is_same_v<ADataType, _Float16>)
-        {
-            std::cout << ", A init: ";
-            if(aInitMode_ == "random")
-                std::cout << "Tensile-style Random; seed=" << aInitSeed_ << std::endl;
-            else
-                std::cout << "integer ramp (K * linearM + k) * scale" << std::endl;
-        }
-        else
-            std::cout << std::endl;
+        std::cout << std::endl << "Non-Swizzled InputA: (K, M): (" << K << ", " << M << ")" << std::endl;
         print_row_by_row(inputA_h.data(), K, M, true);
 
         if constexpr(!std::is_same_v<ADataType, _Float16>)
@@ -182,11 +172,7 @@ private:
                 tn_roctx_push("TN_pre_shuffle_doSwizzleF8");
                 SwizzleRdna4::tnSlabDoSwizzleF8(tensorA_h, swizzledA_h);
                 tn_roctx_pop();
-                std::cout << std::endl
-                          << "Swizzled InputA (RM 16×32 per tile; segment interleave top/bottom rows):"
-                          << std::endl;
-                printTensorFlatDecodedF8(std::cout, swizzledA_h);
-                std::cout << "swizzledA_h: " << std::endl;
+                std::cout << "Flat decoded swizzledA_h: " << std::endl;
                 printTensorFlatDecodedF8(std::cout, swizzledA_h);
                 std::cout << "Swizzled A linear storage hex (" << swizzledA_h.getDesc().flattenSize()
                           << " elements)" << std::endl;

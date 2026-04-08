@@ -6,7 +6,7 @@
 //
 // NN RDNA4: A is col-major lda=M; swizzle path uses lane-ordered layout (NN_HHS_BH_UserArgs_MT16x16x32_DTVA.s SWZ).
 // See asm/rdna4_swzA/doc/NN_doSwizzle_coalesced_A.md and NN_doSwizzle_A_layout_visualization.html
-// FP8 swizzled A uses the same TN slab permute as TN (RM M×K staging → slab), not FP16 V(r,c).
+// FP8 swizzled A uses TN `tnSlabDoSwizzleF8` (pre-shuffle chunk for one b128/lane), not FP16 V(r,c) nor FP16 permute.
 
 #include <algorithm>
 #include <cassert>
@@ -244,8 +244,8 @@ private:
                 nn_roctx_pop();
                 std::cout << std::endl
                           << "Swizzled InputA (" << (M * K)
-                          << " elems): FP16 = V(r,c) RM 16×32; FP8 = same permute as TN doSwizzleF8LaneContiguous "
-                             "(RM M×K → slab), so linear bytes match TN swizzle A."
+                          << " elems): FP16 = V(r,c) RM 16×32; FP8 = TN tnSlabDoSwizzleF8 scatter "
+                             "(16 fp8/lane for one b128), not FP16 permute(0,2,3,1,4) slab."
                           << std::endl;
                 printTensorFlatDecodedF8(std::cout, swizzledA_h);
                 std::cout << "swizzledA_h: " << std::endl;
